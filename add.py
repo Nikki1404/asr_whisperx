@@ -1,136 +1,183 @@
-# components/audio_processing.py
+# components/whisperx_asr.py
 import os
+import threading
 import time
+from typing import Optional, Dict, Any, List
+
+import torch
+import torch.serialization
 import whisperx
-from fastapi import HTTPException
+from whisperx.diarize import DiarizationPipeline
 
-from config import ALL_CONFIG
 from components.logger import get_logger
-from components.utils import (
-    normalize_to_whisper_wav,
-    get_audio_duration_sec,
-    safe_remove,
-)
-from components.merge_speakers import TranscriptMerger
-from components.post_processing_utils import post_process_itn_output
-from components.whisperx_asr import get_whisperx_client
-from components.audio_chunking_array import chunk_audio_array
 
-logger = get_logger("audio-processing")
-merger = TranscriptMerger()
+logger = get_logger("whisperx-asr")
 
 
-def process_audio_file(
-    file_path: str,
-    asr_pipeline: str = "whisper",
-    debug_enabled: bool = False,
-    diarize: bool | None = None,
-    min_speakers: int | None = None,
-    max_speakers: int | None = None,
-):
-    if asr_pipeline != "whisper":
-        raise HTTPException(status_code=400, detail="Only whisper supported")
+def _overlap(a0: float, a1: float, b0: float, b1: float) -> float:
+    return max(0.0, min(a1, b1) - max(a0, b0))
 
-    wav_path = None
-    try:
-        wav_path = normalize_to_whisper_wav(file_path)
-        duration = get_audio_duration_sec(wav_path)
 
-        diarize_enabled = (
-            diarize
-            if diarize is not None
-            else bool(ALL_CONFIG.get("ASR", {}).get("DIARIZATION", False))
+class WhisperXDiarizationClient:
+    """
+    WhisperX wrapper:
+      - Transcription
+      - Diarization (pyannote)
+      - Speaker assignment by overlap (FAST)
+
+    IMPORTANT CHANGE:
+      - We expose methods to:
+          diarize once on full audio
+          transcribe chunks without diarizing each chunk
+          then assign speakers using overlap
+    """
+
+    _lock = threading.Lock()
+    _instances = {}
+
+    def __new__(cls, model_size: str = "base"):
+        with cls._lock:
+            if model_size not in cls._instances:
+                inst = super().__new__(cls)
+                inst._init(model_size)
+                cls._instances[model_size] = inst
+        return cls._instances[model_size]
+
+    def _init(self, model_size: str):
+        self.model_size = model_size
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.compute_type = "float16" if self.device == "cuda" else "int8"
+
+        if self.device == "cuda":
+            torch.backends.cudnn.benchmark = True
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+            except Exception:
+                pass
+
+        logger.info(
+            f"Loading WhisperX model='{model_size}' device='{self.device}' compute='{self.compute_type}'"
         )
 
-        # ✅ Reuse singleton model
-        asr = get_whisperx_client(ALL_CONFIG["ASR"]["MODEL_SIZE"])
-        language = ALL_CONFIG["ASR"].get("LANGUAGE")
+        self.model = whisperx.load_model(
+            model_size,
+            self.device,
+            compute_type=self.compute_type,
+        )
 
-        t_start = time.time()
+        self.diarize_model = None
+        logger.info("WhisperX ASR model loaded")
 
-        # ✅ Load audio ONCE (float array @16k mono, WhisperX loader)
-        t0 = time.time()
-        audio = whisperx.load_audio(wav_path)
-        load_audio_sec = round(time.time() - t0, 3)
+    def _patch_torch_for_pyannote(self):
+        try:
+            from omegaconf.listconfig import ListConfig
+            from omegaconf.dictconfig import DictConfig
+            torch.serialization.add_safe_globals([ListConfig, DictConfig])
+        except Exception:
+            pass
 
-        # ✅ Diarize ONCE on full audio (mandatory if diarize_enabled=True)
-        diar_sec = 0.0
-        diarization = None
-        if diarize_enabled:
-            t1 = time.time()
-            diarization = asr.diarize_audio_array(
-                audio,
-                min_speakers=min_speakers,
-                max_speakers=max_speakers,
-            )
-            diar_sec = round(time.time() - t1, 3)
+    def _ensure_diarizer(self):
+        if self.diarize_model is not None:
+            return
 
-        # ✅ Chunk IN MEMORY (no ffmpeg temp wav)
-        chunk_sec = int(os.getenv("AUDIO_CHUNK_SEC", "60"))          # default 60 for speed
-        overlap_sec = int(os.getenv("AUDIO_CHUNK_OVERLAP_SEC", "2")) # keep small
-        chunks = chunk_audio_array(audio, chunk_sec, overlap_sec, sample_rate=16000)
+        hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+        if not hf_token:
+            raise RuntimeError("HF_TOKEN not set for diarization")
 
-        all_segments = []
-        asr_sec_sum = 0.0
+        self._patch_torch_for_pyannote()
 
-        # ✅ Transcribe chunks WITHOUT diarization
-        for chunk_audio, offset in chunks:
-            t2 = time.time()
-            result = asr.transcribe_audio_array(chunk_audio, language=language)
-            asr_sec_sum += (time.time() - t2)
+        logger.info("Loading diarization pipeline (pyannote)")
+        self.diarize_model = DiarizationPipeline(
+            use_auth_token=hf_token,
+            device=self.device,
+        )
 
-            for seg in result.get("segments", []):
-                seg["start"] = float(seg.get("start", 0.0)) + offset
-                seg["end"] = float(seg.get("end", 0.0)) + offset
-                all_segments.append(seg)
 
-        # ✅ Assign speakers using global diarization timeline
-        if diarize_enabled and diarization is not None:
-            all_segments = asr.assign_speakers_to_segments(all_segments, diarization)
-        else:
-            for seg in all_segments:
-                seg["speaker"] = seg.get("speaker", "Speaker 1")
+    def assign_speakers_to_segments(
+        self,
+        segments: List[Dict[str, Any]],
+        diarization,
+        default_speaker: str = "SPEAKER_00",
+    ) -> List[Dict[str, Any]]:
+        turns = []
 
-        total_time = round(time.time() - t_start, 2)
 
-        # Post-process + merge (same behavior)
-        sentences = []
-        for seg in all_segments:
-            text = (seg.get("text") or "").strip()
-            if not text:
-                continue
+        if hasattr(diarization, "iterrows"):  # pandas DataFrame
+            for _, r in diarization.iterrows():
+                turns.append((float(r["start"]), float(r["end"]), str(r["speaker"])))
+        elif hasattr(diarization, "itertracks"):  # pyannote Annotation
+            for seg, _, label in diarization.itertracks(yield_label=True):
+                turns.append((float(seg.start), float(seg.end), str(label)))
 
-            text = post_process_itn_output(
-                text,
-                ALL_CONFIG["ASR"].get("TEXT_NORMALIZATION", False),
-            )
+        for s in segments:
+            s0, s1 = float(s["start"]), float(s["end"])
+            best_spk, best_ov = default_speaker, 0.0
+            for t0, t1, spk in turns:
+                ov = _overlap(s0, s1, t0, t1)
+                if ov > best_ov:
+                    best_ov, best_spk = ov, spk
+            s["speaker"] = best_spk
 
-            speaker = seg.get("speaker", "Speaker 1")
+        return segments
 
-            sentences.append({
-                "speaker": speaker,
-                "sentence": text,
-                "start_time": round(seg["start"], 2),
-                "end_time": round(seg["end"], 2),
-            })
 
-        out = {"transcript": merger.merge_sentences(sentences)}
+    def diarize_audio_array(
+        self,
+        audio,
+        min_speakers: Optional[int] = None,
+        max_speakers: Optional[int] = None,
+    ):
+        """
+        Run diarization ONCE for the full audio.
+        """
+        self._ensure_diarizer()
 
-        if debug_enabled:
-            out["debug"] = {
-                "no_of_calls": len(chunks),  # number of ASR chunk calls
-                "audio_duration_sec": round(duration, 2),
-                "diarization_enabled": diarize_enabled,
-                "load_audio_sec": load_audio_sec,
-                "diar_sec": diar_sec,
-                "asr_sec_sum": round(asr_sec_sum, 2),
-                "total_time_asr": total_time,
-                "chunk_sec": chunk_sec,
-                "overlap_sec": overlap_sec,
-                "batch_size": int(os.getenv("WHISPERX_BATCH_SIZE", "32")),
-            }
+        # depending on pyannote version, min/max speakers may or may not work.
+        # We'll pass only if provided.
+        kwargs = {}
+        if min_speakers is not None:
+            kwargs["min_speakers"] = min_speakers
+        if max_speakers is not None:
+            kwargs["max_speakers"] = max_speakers
 
-        return out
+        return self.diarize_model(audio, **kwargs)
 
-    finally:
-        safe_remove(wav_path)
+    def transcribe_audio_array(
+        self,
+        audio,
+        language: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Transcribe an audio array (chunk) WITHOUT diarization.
+        """
+        batch_size = int(os.getenv("WHISPERX_BATCH_SIZE", "32"))
+
+        t1 = time.perf_counter()
+        result = self.model.transcribe(audio, language=language, batch_size=batch_size)
+        asr_sec = round(time.perf_counter() - t1, 3)
+
+        # attach perf
+        result["__perf"] = {
+            "asr_sec": asr_sec,
+            "batch_size": batch_size,
+            "device": self.device,
+            "compute_type": self.compute_type,
+        }
+        return result
+
+
+# =====================================================
+# GLOBAL SINGLETON ACCESSOR
+# =====================================================
+_GLOBAL_WX_CLIENT = None
+_GLOBAL_WX_LOCK = threading.Lock()
+
+
+def get_whisperx_client(model_size: str = "base") -> WhisperXDiarizationClient:
+    global _GLOBAL_WX_CLIENT
+    with _GLOBAL_WX_LOCK:
+        if _GLOBAL_WX_CLIENT is None:
+            logger.info("Creating global WhisperXDiarizationClient (singleton)")
+            _GLOBAL_WX_CLIENT = WhisperXDiarizationClient(model_size)
+    return _GLOBAL_WX_CLIENT
