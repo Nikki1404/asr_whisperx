@@ -1,107 +1,136 @@
-# main.py
+# components/audio_processing.py
 import os
 import time
-import uuid
-import jiwer
-import numpy as np
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, File, UploadFile, Request, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import uvicorn
+import whisperx
+from fastapi import HTTPException
 
 from config import ALL_CONFIG
 from components.logger import get_logger
-from components.audio_processing import process_audio_file
+from components.utils import (
+    normalize_to_whisper_wav,
+    get_audio_duration_sec,
+    safe_remove,
+)
+from components.merge_speakers import TranscriptMerger
+from components.post_processing_utils import post_process_itn_output
 from components.whisperx_asr import get_whisperx_client
+from components.audio_chunking_array import chunk_audio_array
 
-logger = get_logger("main")
-
-
-class WerData(BaseModel):
-    ground_truth: str
-    transcription: str
+logger = get_logger("audio-processing")
+merger = TranscriptMerger()
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("Preloading WhisperX + diarizer at startup")
-
-    wx = get_whisperx_client(ALL_CONFIG["ASR"]["MODEL_SIZE"])
-
-    # Warm diarizer
-    try:
-        wx._ensure_diarizer()
-        logger.info("Diarizer loaded")
-    except Exception as e:
-        logger.error(f"Diarizer load failed: {e}")
-        # diarization is mandatory for you, so failing here is good to catch early
-
-    # Warm ASR + diarizer with 1 sec dummy audio to reduce first-request latency
-    try:
-        dummy = np.zeros(16000, dtype=np.float32)
-        _ = wx.transcribe_audio_array(dummy, language=ALL_CONFIG["ASR"].get("LANGUAGE"))
-        _ = wx.diarize_audio_array(dummy)
-        logger.info("Warmup done (ASR + diar)")
-    except Exception as e:
-        logger.warning(f"Warmup skipped: {e}")
-
-    yield
-
-
-app = FastAPI(
-    title="ASR Offline Whisper",
-    root_path="/asr",
-    lifespan=lifespan
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    allow_origins=["*"],
-)
-
-
-@app.post("/upload_file")
-async def upload_file(
-    request: Request,
-    file: UploadFile = File(...)
+def process_audio_file(
+    file_path: str,
+    asr_pipeline: str = "whisper",
+    debug_enabled: bool = False,
+    diarize: bool | None = None,
+    min_speakers: int | None = None,
+    max_speakers: int | None = None,
 ):
-    path = f"/tmp/{uuid.uuid4()}_{file.filename}"
+    if asr_pipeline != "whisper":
+        raise HTTPException(status_code=400, detail="Only whisper supported")
 
+    wav_path = None
     try:
-        with open(path, "wb") as f:
-            while chunk := await file.read(1024 * 1024):
-                f.write(chunk)
+        wav_path = normalize_to_whisper_wav(file_path)
+        duration = get_audio_duration_sec(wav_path)
 
-        # diarization mandatory → keep True
-        # optionally you can override via header diarization:true/false later
-        diarize = True
+        diarize_enabled = (
+            diarize
+            if diarize is not None
+            else bool(ALL_CONFIG.get("ASR", {}).get("DIARIZATION", False))
+        )
 
-        st = time.time()
-        result = process_audio_file(path, diarize=diarize, debug_enabled=True)
+        # ✅ Reuse singleton model
+        asr = get_whisperx_client(ALL_CONFIG["ASR"]["MODEL_SIZE"])
+        language = ALL_CONFIG["ASR"].get("LANGUAGE")
 
-        return {
-            "status": 200,
-            "response": result["transcript"],
-            "response_time": round(time.time() - st, 2),
-            "debug": result.get("debug"),
-        }
+        t_start = time.time()
 
-    except Exception as e:
-        raise HTTPException(500, str(e))
+        # ✅ Load audio ONCE (float array @16k mono, WhisperX loader)
+        t0 = time.time()
+        audio = whisperx.load_audio(wav_path)
+        load_audio_sec = round(time.time() - t0, 3)
+
+        # ✅ Diarize ONCE on full audio (mandatory if diarize_enabled=True)
+        diar_sec = 0.0
+        diarization = None
+        if diarize_enabled:
+            t1 = time.time()
+            diarization = asr.diarize_audio_array(
+                audio,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers,
+            )
+            diar_sec = round(time.time() - t1, 3)
+
+        # ✅ Chunk IN MEMORY (no ffmpeg temp wav)
+        chunk_sec = int(os.getenv("AUDIO_CHUNK_SEC", "60"))          # default 60 for speed
+        overlap_sec = int(os.getenv("AUDIO_CHUNK_OVERLAP_SEC", "2")) # keep small
+        chunks = chunk_audio_array(audio, chunk_sec, overlap_sec, sample_rate=16000)
+
+        all_segments = []
+        asr_sec_sum = 0.0
+
+        # ✅ Transcribe chunks WITHOUT diarization
+        for chunk_audio, offset in chunks:
+            t2 = time.time()
+            result = asr.transcribe_audio_array(chunk_audio, language=language)
+            asr_sec_sum += (time.time() - t2)
+
+            for seg in result.get("segments", []):
+                seg["start"] = float(seg.get("start", 0.0)) + offset
+                seg["end"] = float(seg.get("end", 0.0)) + offset
+                all_segments.append(seg)
+
+        # ✅ Assign speakers using global diarization timeline
+        if diarize_enabled and diarization is not None:
+            all_segments = asr.assign_speakers_to_segments(all_segments, diarization)
+        else:
+            for seg in all_segments:
+                seg["speaker"] = seg.get("speaker", "Speaker 1")
+
+        total_time = round(time.time() - t_start, 2)
+
+        # Post-process + merge (same behavior)
+        sentences = []
+        for seg in all_segments:
+            text = (seg.get("text") or "").strip()
+            if not text:
+                continue
+
+            text = post_process_itn_output(
+                text,
+                ALL_CONFIG["ASR"].get("TEXT_NORMALIZATION", False),
+            )
+
+            speaker = seg.get("speaker", "Speaker 1")
+
+            sentences.append({
+                "speaker": speaker,
+                "sentence": text,
+                "start_time": round(seg["start"], 2),
+                "end_time": round(seg["end"], 2),
+            })
+
+        out = {"transcript": merger.merge_sentences(sentences)}
+
+        if debug_enabled:
+            out["debug"] = {
+                "no_of_calls": len(chunks),  # number of ASR chunk calls
+                "audio_duration_sec": round(duration, 2),
+                "diarization_enabled": diarize_enabled,
+                "load_audio_sec": load_audio_sec,
+                "diar_sec": diar_sec,
+                "asr_sec_sum": round(asr_sec_sum, 2),
+                "total_time_asr": total_time,
+                "chunk_sec": chunk_sec,
+                "overlap_sec": overlap_sec,
+                "batch_size": int(os.getenv("WHISPERX_BATCH_SIZE", "32")),
+            }
+
+        return out
+
     finally:
-        if os.path.exists(path):
-            os.remove(path)
-
-
-@app.post("/wer_score")
-async def calculate_wer(data: WerData):
-    return {"wer": jiwer.wer(data.ground_truth, data.transcription)}
-
-
-if __name__ == "__main__":
-    logger.info("Application is up (asr-offline-whisper)")
-    uvicorn.run("main:app", host="0.0.0.0", port=8002)
+        safe_remove(wav_path)
