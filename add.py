@@ -8,6 +8,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from botocore.config import Config
 
+# ====================================
+# CONFIG
+# ====================================
 S3_BUCKET = "cx-speech"
 S3_PREFIX = "asr-offline/load_testing_data/mp4_10_min/"
 ASR_URL = "http://127.0.0.1:8002/asr/upload_file"
@@ -16,13 +19,15 @@ TIMEOUT = 1800
 TMP_DIR = "/tmp/whisperx_s3"
 os.makedirs(TMP_DIR, exist_ok=True)
 
-WORKERS = 3                 # GPU safe parallelism
+WORKERS = 3
 AUDIO_CHUNK_SEC = 60
 WHISPERX_BATCH_SIZE = 48
 
 OUTPUT_CSV = f"whisperx_fast_{int(time.time())}.csv"
 
-
+# ====================================
+# AWS S3 (parallel optimized)
+# ====================================
 s3 = boto3.client(
     "s3",
     config=Config(
@@ -31,6 +36,9 @@ s3 = boto3.client(
     ),
 )
 
+# ====================================
+# GPU Stats
+# ====================================
 def get_gpu_stats():
     try:
         out = subprocess.check_output(
@@ -45,6 +53,9 @@ def get_gpu_stats():
     except Exception:
         return "", ""
 
+# ====================================
+# S3 LIST
+# ====================================
 def list_s3_audio_files():
     paginator = s3.get_paginator("list_objects_v2")
     keys = []
@@ -54,12 +65,26 @@ def list_s3_audio_files():
                 keys.append(obj["Key"])
     return keys
 
+# ====================================
+# FORCE DOWNLOAD (overwrite always)
+# ====================================
 def download_s3(key):
     path = os.path.join(TMP_DIR, os.path.basename(key))
-    if not os.path.exists(path):
-        s3.download_file(S3_BUCKET, key, path)
+
+    if os.path.exists(path):
+        os.remove(path)
+
+    print(f"⬇ Downloading {key} → {path}")
+    s3.download_file(S3_BUCKET, key, path)
+
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        raise RuntimeError(f"Download failed for {key}")
+
     return path
 
+# ====================================
+# METADATA
+# ====================================
 def get_audio_metadata(path):
     try:
         out = subprocess.check_output(
@@ -77,6 +102,9 @@ def get_audio_metadata(path):
     except Exception:
         return "", ""
 
+# ====================================
+# TRANSCRIBE (NO DIARIZATION)
+# ====================================
 def transcribe(path):
     os.environ["AUDIO_CHUNK_SEC"] = str(AUDIO_CHUNK_SEC)
     os.environ["WHISPERX_BATCH_SIZE"] = str(WHISPERX_BATCH_SIZE)
@@ -108,16 +136,19 @@ def transcribe(path):
         "text": r.json().get("response", ""),
     }
 
+# ====================================
+# MAIN
+# ====================================
 def main():
     keys = list_s3_audio_files()
-    print(f"\n Found {len(keys)} files in S3")
+    print(f"\n🎧 Found {len(keys)} files in S3")
 
-    print(" Downloading from S3 once...")
+    print("\n📥 Downloading all files from S3...")
     paths = [download_s3(k) for k in tqdm(keys)]
 
     rows = []
 
-    print("\n Running fast WhisperX (no diarization)")
+    print("\n🚀 Running WhisperX (NO diarization)")
     start = time.time()
 
     with ThreadPoolExecutor(max_workers=WORKERS) as exe:
@@ -139,9 +170,8 @@ def main():
                 r["text"],
             ])
 
-    print(f"\n Total wall time: {round(time.time()-start,2)} sec")
+    print(f"\n⏱ Total wall time: {round(time.time() - start, 2)} sec")
 
-    # Write CSV
     with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
@@ -159,7 +189,7 @@ def main():
         ])
         writer.writerows(rows)
 
-    print(f"\n Saved → {OUTPUT_CSV}")
+    print(f"\n📊 Results saved → {OUTPUT_CSV}")
 
 if __name__ == "__main__":
     main()
