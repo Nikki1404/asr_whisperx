@@ -11,11 +11,6 @@ async def upload_file(
             while chunk := await file.read(1024 * 1024):
                 f.write(chunk)
 
-        # ------------------------------------------
-        # Resolve diarization flag (ORDER OF TRUTH)
-        # 1. HTTP header
-        # 2. config.yaml
-        # ------------------------------------------
         diarize = request.headers.get("diarization")
         if diarize is not None:
             diarize = diarize.lower() == "true"
@@ -31,9 +26,6 @@ async def upload_file(
 
         debug_enabled = request.headers.get("debug", "false").lower() == "true"
 
-        # ------------------------------------------
-        # Run ASR
-        # ------------------------------------------
         st = time.time()
 
         result = process_audio_file(
