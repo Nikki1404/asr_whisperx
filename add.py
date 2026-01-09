@@ -1,57 +1,59 @@
-import whisperx
-from app.config import settings
-from services.whisperx_asr import WhisperXASR
-from services.diarize import Diarizer
-from services.chunker import iter_chunks
-from utils.timers import stopwatch
+from fastapi import FastAPI, UploadFile, File, Header, APIRouter
+from pathlib import Path
+import time
 
-class OfflineASRPipeline:
-    def __init__(self):
-        self.asr = WhisperXASR()
-        self.diar = Diarizer()
+from utils.audio import to_wav_16k_mono
+from utils.fileio import ensure_dir
+from services.pipeline import OfflineASRPipeline
 
-    def run(self, wav_path, min_speakers=None, max_speakers=None):
-        timings = {}
+app = FastAPI()
+router = APIRouter(prefix="/asr")
 
-        audio = whisperx.load_audio(wav_path)
-        sr = 16000
-        segments = []
+UPLOADS = "uploads"
+OUTPUTS = "outputs"
+ensure_dir(UPLOADS)
+ensure_dir(OUTPUTS)
 
-        # ---------------- ASR ----------------
-        ttft_ms = None
-        with stopwatch() as asr_timer:
-            for chunk, offset in iter_chunks(
-                audio, sr, settings.chunk_sec, settings.stride_sec
-            ):
-                res = self.asr.transcribe(chunk)
-                for s in res.get("segments", []):
-                    s["start"] += offset
-                    s["end"] += offset
-                    segments.append(s)
+pipeline = OfflineASRPipeline()
 
-                if ttft_ms is None and segments:
-                    ttft_ms = asr_timer()
+@router.get("/health")
+def health():
+    return {"status": "ok"}
 
-        timings["asr_ttft_ms"] = round(ttft_ms, 2)
-        timings["asr_total_ms"] = round(asr_timer(), 2)
+@router.post("/upload_folder")
+async def upload_folder(
+    file: UploadFile = File(...),
+    min_speakers: int | None = Header(None, convert_underscores=False),
+    max_speakers: int | None = Header(None, convert_underscores=False),
+):
+    start = time.perf_counter()
 
-        # ---------------- DIARIZATION ----------------
-        if settings.diarize:
-            with stopwatch() as diar_timer:
-                diar = self.diar.run(wav_path, min_speakers, max_speakers)
-            timings["diarization_ms"] = round(diar_timer(), 2)
+    raw = Path(UPLOADS) / file.filename
+    raw.write_bytes(await file.read())
 
-            with stopwatch() as merge_timer:
-                result = whisperx.assign_word_speakers(
-                    diar, {"segments": segments}
-                )
-            timings["merge_ms"] = round(merge_timer(), 2)
-        else:
-            result = {"segments": segments}
-            timings["diarization_ms"] = 0.0
-            timings["merge_ms"] = 0.0
+    wav = to_wav_16k_mono(str(raw), UPLOADS)
 
-        return result, timings
+    result, timings = pipeline.run(wav, min_speakers, max_speakers)
+
+    e2e_ms = round((time.perf_counter() - start) * 1000, 2)
+
+    return {
+        "file": file.filename,
+
+        # ✅ LATENCY
+        "latency_ms": {
+            "asr_latency_ms": timings["asr_ttft_ms"],
+            "processing_latency_ms": timings["asr_total_ms"],
+            "e2e_latency_ms": e2e_ms
+        },
+
+        # 🔍 DETAILED TIMINGS
+        "timings_ms": timings,
+
+        "segments": len(result["segments"])
+    }
+
+app.include_router(router)
 
 121.2 Successfully built antlr4-python3-runtime docopt julius
 121.2 ERROR: Exception:
