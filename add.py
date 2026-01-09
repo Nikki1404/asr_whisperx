@@ -1,45 +1,57 @@
-from pathlib import Path
-import subprocess
+import whisperx
+from app.config import settings
+from services.whisperx_asr import WhisperXASR
+from services.diarize import Diarizer
+from services.chunker import iter_chunks
+from utils.timers import stopwatch
 
-def to_wav_16k_mono(input_path: str, out_dir: str) -> str:
-    input_path = Path(input_path)
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+class OfflineASRPipeline:
+    def __init__(self):
+        self.asr = WhisperXASR()
+        self.diar = Diarizer()
 
-    out_path = out_dir / f"{input_path.stem}_16k.wav"
+    def run(self, wav_path, min_speakers=None, max_speakers=None):
+        timings = {}
 
-    if input_path.suffix.lower() == ".wav":
-        try:
-            probe = subprocess.check_output(
-                [
-                    "ffprobe", "-v", "error",
-                    "-select_streams", "a:0",
-                    "-show_entries", "stream=channels,sample_rate",
-                    "-of", "default=noprint_wrappers=1:nokey=1",
-                    str(input_path)
-                ],
-                text=True
-            ).strip().split("\n")
+        audio = whisperx.load_audio(wav_path)
+        sr = 16000
+        segments = []
 
-            if int(probe[0]) == 1 and int(probe[1]) == 16000:
-                return str(input_path)
-        except Exception:
-            pass
+        # ---------------- ASR ----------------
+        ttft_ms = None
+        with stopwatch() as asr_timer:
+            for chunk, offset in iter_chunks(
+                audio, sr, settings.chunk_sec, settings.stride_sec
+            ):
+                res = self.asr.transcribe(chunk)
+                for s in res.get("segments", []):
+                    s["start"] += offset
+                    s["end"] += offset
+                    segments.append(s)
 
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-i", str(input_path),
-            "-vn",
-            "-ac", "1",
-            "-ar", "16000",
-            "-c:a", "pcm_s16le",
-            "-threads", "0",
-            str(out_path)
-        ],
-        check=True
-    )
-    return str(out_path)
+                if ttft_ms is None and segments:
+                    ttft_ms = asr_timer()
+
+        timings["asr_ttft_ms"] = round(ttft_ms, 2)
+        timings["asr_total_ms"] = round(asr_timer(), 2)
+
+        # ---------------- DIARIZATION ----------------
+        if settings.diarize:
+            with stopwatch() as diar_timer:
+                diar = self.diar.run(wav_path, min_speakers, max_speakers)
+            timings["diarization_ms"] = round(diar_timer(), 2)
+
+            with stopwatch() as merge_timer:
+                result = whisperx.assign_word_speakers(
+                    diar, {"segments": segments}
+                )
+            timings["merge_ms"] = round(merge_timer(), 2)
+        else:
+            result = {"segments": segments}
+            timings["diarization_ms"] = 0.0
+            timings["merge_ms"] = 0.0
+
+        return result, timings
 
 121.2 Successfully built antlr4-python3-runtime docopt julius
 121.2 ERROR: Exception:
