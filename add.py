@@ -1,4 +1,8 @@
-import os
+with diarization outout:
+{"speaker":"Speaker 1","sentence":"Thank you, thank you. Absolutely, you two. Is there anything else I may assist with before I let you go? No, that's it. Thank you. I really, really, greatly, greatly appreciate it. You're so welcome. Thank you again for calling Inspire Financial. I have a wonderful weekend. Bye. And you too. Bye. Bye.","start_time":5568.03,"end_time":5592.57}],"response_time":25.38,"debug":null}
+
+with diarization output :
+,{"speaker":"SPEAKER_00","sentence":"No, I will ask with them that as well. We are looking for financing, right? So we don't need you. So I am going to hang up the call as well, okay? Yes, please. All right. Thank you. Thank you for calling. Thank you, Lily. Hold the line. Yeah, please hold the line.","start_time":7999.09,"end_time":8021.78}],"response_time":150.36,"debug":{"no_of_calls":1,"total_time_asr":147.66,"audio_duration_sec":8021.76,"rtf":0.018,"diarization_enabled":true,"last_segment_end_sec":8021.78,"whisperx_perf":{"load_audio_sec":1.864,"asr_sec":14.094,"diar_sec":131.428,"assign_sec":0.255,"mode":"fast_no_align","batch_size":32,"device":"cuda","compute_type":"float16"}}}import os
 import time
 import csv
 import boto3
